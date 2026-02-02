@@ -1,0 +1,105 @@
+#!/bin/sh
+set -eu
+
+if ! command -v jq >/dev/null 2>&1; then
+	printf '%s\n' "test: jq is required (not found in PATH)" >&2
+	exit 127
+fi
+
+tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t kv)"
+trap 'rm -rf "$tmpdir"' EXIT INT HUP TERM
+
+kv="./bin/kv"
+
+fail() {
+	printf '%s\n' "FAIL: $*" >&2
+	exit 1
+}
+
+assert_eq() {
+	name=$1
+	got=$2
+	want=$3
+	if [ "$got" != "$want" ]; then
+		printf '%s\n' "FAIL: $name" >&2
+		printf '%s\n' "got:" >&2
+		printf '%s\n' "$got" >&2
+		printf '%s\n' "want:" >&2
+		printf '%s\n' "$want" >&2
+		exit 1
+	fi
+}
+
+run() {
+	out="$tmpdir/out"
+	err="$tmpdir/err"
+	: >"$out"
+	: >"$err"
+
+	set +e
+	"$@" >"$out" 2>"$err"
+	st=$?
+	set -e
+
+	printf '%s\n' "$st"
+}
+
+canon_jsonl() {
+	jq -cS .
+}
+
+# 1) strict vs loose behavior
+st=$(printf 'a=1 bad b=2\n' | run "$kv" parse)
+if [ "$st" -eq 0 ]; then
+	fail "strict: expected non-zero exit"
+fi
+
+got=$(printf 'a=1 bad b=2\n' | "$kv" parse --mode loose | canon_jsonl)
+assert_eq "loose skips malformed tokens" "$got" '{"a":"1","b":"2"}'
+
+# 2) equals vs colon parsing
+got=$(printf 'a=1 b=2\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "equals parsing" "$got" '{"a":"1","b":"2"}'
+
+got=$(printf 'Host: example.com\n' | "$kv" parse --delim colon --trim | canon_jsonl)
+assert_eq "colon parsing + trim" "$got" '{"Host":"example.com"}'
+
+# 3) quotes handling
+got=$(printf 'msg="hi there"\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "double quotes" "$got" '{"msg":"hi there"}'
+
+got=$(printf "msg='hi there'\n" | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "single quotes" "$got" '{"msg":"hi there"}'
+
+got=$(printf 'msg="hi \\"there\\""\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "escaped quotes in double quotes" "$got" '{"msg":"hi \"there\""}'
+
+# 4) duplicate keys behavior
+got=$(printf 'a=1 a=2\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "duplicate keys last wins" "$got" '{"a":"2"}'
+
+got=$(printf 'a=1 a=2\n' | "$kv" parse --delim equals --allow-dup | canon_jsonl)
+assert_eq "duplicate keys arrays" "$got" '{"a":["1","2"]}'
+
+# 5) multi-token lines (including quoted spaces)
+got=$(printf 'level=info msg="hi there" user=bob\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "multi-token line" "$got" '{"level":"info","msg":"hi there","user":"bob"}'
+
+# 6) keep-empty
+got=$(printf 'a=\n' | "$kv" parse --delim equals | canon_jsonl)
+assert_eq "skip empty values by default" "$got" '{}'
+
+got=$(printf 'a=\n' | "$kv" parse --delim equals --keep-empty | canon_jsonl)
+assert_eq "keep empty values" "$got" '{"a":""}'
+
+# 7) kv json: single object / multi-line error
+got=$(printf 'a=1 b=2\n' | "$kv" json --delim equals | jq -cS .)
+assert_eq "kv json outputs object" "$got" '{"a":"1","b":"2"}'
+
+st=$(printf 'a=1\nb=2\n' | run "$kv" json --delim equals)
+if [ "$st" -eq 0 ]; then
+	fail "kv json: expected non-zero exit on multi-line input"
+fi
+
+printf '%s\n' "ok"
+

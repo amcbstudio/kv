@@ -1,0 +1,387 @@
+#!/bin/sh
+set -eu
+
+kv_usage() {
+	cat >&2 <<'EOF'
+kv - parse key-value fragments into JSON / JSON Lines
+
+Usage:
+  kv parse [--mode strict|loose] [--delim auto|equals|colon] [--trim] [--keep-empty] [--allow-dup] [file|-]
+  kv json  [--mode strict|loose] [--delim auto|equals|colon] [--trim] [--keep-empty] [--allow-dup] [file|-]
+
+Notes:
+  - jq is required.
+  - kv parse reads stdin when no file is provided (or file is "-") and emits JSON Lines (one object per input line).
+  - kv json reads exactly one non-empty line and emits a single JSON object.
+EOF
+}
+
+kv_die() {
+	msg=$1
+	code=${2-1}
+	printf '%s\n' "$msg" >&2
+	exit "$code"
+}
+
+kv_require_jq() {
+	if ! command -v jq >/dev/null 2>&1; then
+		kv_die "kv: jq is required (not found in PATH)" 127
+	fi
+}
+
+kv_jq_program() {
+	cat <<'JQ'
+def key_ok: test("^[A-Za-z0-9_.-]+$");
+
+def trim_ws:
+  sub("^\\s+"; "") | sub("\\s+$"; "");
+
+def unescape_dq:
+  . as $s
+  | ($s | explode) as $cs
+  | reduce range(0; $cs|length) as $i ({out:"", esc:false};
+      if .esc then
+        .out += ([ $cs[$i] ] | implode)
+        | .esc = false
+      else
+        ($cs[$i]) as $c
+        | if $c == 92 and ($i+1) < ($cs|length) and (($cs[$i+1] == 34) or ($cs[$i+1] == 92)) then
+            .esc = true
+          else
+            .out += ([ $c ] | implode)
+          end
+      end
+    )
+  | .out;
+
+def unquote:
+  if (length >= 2 and (.[0:1] == "\"") and (.[-1:] == "\"")) then
+    .[1:-1] | unescape_dq
+  elif (length >= 2 and (.[0:1] == "'") and (.[-1:] == "'")) then
+    .[1:-1]
+  else
+    .
+  end;
+
+def is_ws($c):
+  ($c == 32) or ($c == 9) or ($c == 10) or ($c == 13) or ($c == 11) or ($c == 12);
+
+def scan($s; $want_header):
+  ($s | explode) as $cs
+  | reduce range(0; $cs|length) as $i (
+      {tokens: [], cur: "", in_s: false, in_d: false, esc: false, header_key: null, header_start: null, err: null};
+      if .header_key != null then
+        .
+      else
+        ($cs[$i]) as $c
+        | if .esc then
+            .cur += ([ $c ] | implode)
+            | .esc = false
+          elif .in_d then
+            if $c == 92 and ($i+1) < ($cs|length) and (($cs[$i+1] == 34) or ($cs[$i+1] == 92)) then
+              .cur += "\\"
+              | .esc = true
+            elif $c == 34 then
+              .cur += "\""
+              | .in_d = false
+            else
+              .cur += ([ $c ] | implode)
+            end
+          elif .in_s then
+            if $c == 39 then
+              .cur += "'"
+              | .in_s = false
+            else
+              .cur += ([ $c ] | implode)
+            end
+          else
+            if ($want_header
+                and $c == 58
+                and .cur != ""
+                and (.cur | test("^[A-Za-z0-9_.-]+$"))
+                and ( ($i+1) == ($cs|length) or is_ws($cs[$i+1]) )
+            ) then
+              .header_key = .cur
+              | .header_start = ($i + 1)
+              | .cur = ""
+            elif is_ws($c) then
+              if .cur == "" then
+                .
+              else
+                .tokens += [ .cur ]
+                | .cur = ""
+              end
+            elif $c == 34 then
+              .cur += "\""
+              | .in_d = true
+            elif $c == 39 then
+              .cur += "'"
+              | .in_s = true
+            else
+              .cur += ([ $c ] | implode)
+            end
+          end
+      end
+    )
+  | if (.header_key == null and .cur != "") then
+      .tokens += [ .cur ]
+      | .cur = ""
+    else
+      .
+    end
+  | if (.err == null and (.in_d or .in_s)) then
+      .err = "unclosed quote"
+    else
+      .
+    end;
+
+def obj_add($k; $v; $allow_dup):
+  if $allow_dup == 1 then
+    if has($k) then
+      .[$k] |= (if type == "array" then . + [$v] else [., $v] end)
+    else
+      . + {($k): $v}
+    end
+  else
+    . + {($k): $v}
+  end;
+
+def parse_tokens($tokens; $mode; $keep_empty; $allow_dup):
+  reduce $tokens[] as $t ({};
+    ($t | index("=")) as $eq
+    | if $eq == null then
+        if $mode == "strict" then
+          error("kv: malformed token (expected key=value): " + ($t|@json))
+        else
+          .
+        end
+      else
+        ($t[0:$eq]) as $k
+        | ($t[$eq+1:]) as $v_raw
+        | if ($k | key_ok | not) then
+            if $mode == "strict" then
+              error("kv: invalid key: " + ($k|@json))
+            else
+              .
+            end
+          else
+            ($v_raw | unquote) as $v
+            | if ($keep_empty == 0 and $v == "") then
+                .
+              else
+                obj_add($k; $v; $allow_dup)
+              end
+          end
+      end
+  );
+
+def parse_colon_line($line; $mode; $trim; $keep_empty):
+  if ($line | test("^\\s*$")) then
+    {}
+  else
+    ($line | index(":")) as $i
+    | if $i == null then
+        if $mode == "strict" then
+          error("kv: malformed header (expected key: value)")
+        else
+          {}
+        end
+      else
+        ($line[0:$i]) as $k0
+        | ($line[$i+1:]) as $v0
+        | (($k0 | if $trim == 1 then trim_ws else . end)) as $k
+        | (($v0 | if $trim == 1 then trim_ws else . end) | unquote) as $v
+        | if ($k | key_ok | not) then
+            if $mode == "strict" then
+              error("kv: invalid key: " + ($k|@json))
+            else
+              {}
+            end
+          elif ($keep_empty == 0 and $v == "") then
+            {}
+          else
+            {($k): $v}
+          end
+      end
+  end;
+
+def parse_line($line; $mode; $delim; $trim; $keep_empty; $allow_dup):
+  if ($line | test("^\\s*$")) then
+    {}
+  elif $delim == "colon" then
+    parse_colon_line($line; $mode; $trim; $keep_empty)
+  elif $delim == "equals" then
+    (scan($line; false)) as $s
+    | if $s.err != null then
+        if $mode == "strict" then
+          error("kv: " + $s.err)
+        else
+          {}
+        end
+      else
+        parse_tokens($s.tokens; $mode; $keep_empty; $allow_dup)
+      end
+  else
+    (scan($line; true)) as $s
+    | if $s.err != null then
+        if $mode == "strict" then
+          error("kv: " + $s.err)
+        else
+          {}
+        end
+      else
+        (parse_tokens($s.tokens; $mode; $keep_empty; $allow_dup)) as $obj0
+        | if $s.header_key == null then
+            $obj0
+          else
+            ($line[$s.header_start:] | if $trim == 1 then trim_ws else . end | unquote) as $hv
+            | if ($keep_empty == 0 and $hv == "") then
+                $obj0
+              else
+                ($obj0 | obj_add($s.header_key; $hv; $allow_dup))
+              end
+          end
+      end
+  end;
+
+parse_line(.;
+  $mode;
+  $delim;
+  $trim;
+  $keep_empty;
+  $allow_dup
+)
+JQ
+}
+
+kv_parse_opts() {
+	kv_mode=strict
+	kv_delim=auto
+	kv_trim=0
+	kv_keep_empty=0
+	kv_allow_dup=0
+	kv_file=''
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--mode)
+				shift || kv_die "kv: --mode requires an argument" 2
+				if [ $# -lt 1 ]; then
+					kv_die "kv: --mode requires an argument" 2
+				fi
+				kv_mode=$1
+				case "$kv_mode" in strict|loose) ;; *)
+					kv_die "kv: invalid --mode: $kv_mode" 2
+				esac
+				;;
+			--delim)
+				shift || kv_die "kv: --delim requires an argument" 2
+				if [ $# -lt 1 ]; then
+					kv_die "kv: --delim requires an argument" 2
+				fi
+				kv_delim=$1
+				case "$kv_delim" in auto|equals|colon) ;; *)
+					kv_die "kv: invalid --delim: $kv_delim" 2
+				esac
+				;;
+			--trim) kv_trim=1 ;;
+			--keep-empty) kv_keep_empty=1 ;;
+			--allow-dup) kv_allow_dup=1 ;;
+			--help|-h) kv_usage; exit 0 ;;
+			--) shift; break ;;
+			-*) kv_die "kv: unknown option: $1" 2 ;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	if [ $# -gt 0 ]; then
+		kv_file=$1
+		shift
+	else
+		kv_file=''
+	fi
+	if [ $# -gt 0 ]; then
+		kv_die "kv: unexpected arguments" 2
+	fi
+}
+
+kv_cmd_parse() {
+	kv_require_jq
+
+	kv_parse_opts "$@"
+
+	# Build jq program once. Use jq's -R to process input line-by-line.
+	if [ -n "$kv_file" ] && [ "$kv_file" != "-" ]; then
+		if [ ! -f "$kv_file" ]; then
+			kv_die "kv: no such file: $kv_file" 1
+		fi
+		jq -Rc \
+			--arg mode "$kv_mode" \
+			--arg delim "$kv_delim" \
+			--argjson trim "$kv_trim" \
+			--argjson keep_empty "$kv_keep_empty" \
+			--argjson allow_dup "$kv_allow_dup" \
+			"$(kv_jq_program)" <"$kv_file"
+	else
+		jq -Rc \
+			--arg mode "$kv_mode" \
+			--arg delim "$kv_delim" \
+			--argjson trim "$kv_trim" \
+			--argjson keep_empty "$kv_keep_empty" \
+			--argjson allow_dup "$kv_allow_dup" \
+			"$(kv_jq_program)"
+	fi
+}
+
+kv_cmd_json() {
+	kv_require_jq
+
+	# Parse flags first, then read a single non-empty line.
+	kv_parse_opts "$@"
+
+	nonempty=0
+	line=''
+
+	if [ -n "$kv_file" ] && [ "$kv_file" != "-" ]; then
+		if [ ! -f "$kv_file" ]; then
+			kv_die "kv: no such file: $kv_file" 1
+		fi
+		exec 3<"$kv_file"
+	else
+		exec 3<&0
+	fi
+
+	while IFS= read -r cur || [ -n "$cur" ]; do
+		case "$cur" in
+			*[![:space:]]*)
+				nonempty=$((nonempty + 1))
+				if [ "$nonempty" -gt 1 ]; then
+					kv_die "kv: json expects at most one non-empty line" 1
+				fi
+				line=$cur
+				;;
+			*) : ;;
+		esac
+	done <&3
+
+	# If no non-empty lines, treat as empty.
+	printf '%s\n' "${line}" | jq -Rc \
+		--arg mode "$kv_mode" \
+		--arg delim "$kv_delim" \
+		--argjson trim "$kv_trim" \
+		--argjson keep_empty "$kv_keep_empty" \
+		--argjson allow_dup "$kv_allow_dup" \
+		"$(kv_jq_program)"
+}
+
+cmd=${1-}
+shift || true
+
+case "$cmd" in
+	parse) kv_cmd_parse "$@" ;;
+	json) kv_cmd_json "$@" ;;
+	help|--help|-h) kv_usage; exit 0 ;;
+	"") kv_usage; exit 2 ;;
+	*) kv_die "kv: unknown command: $cmd" 2 ;;
+esac
