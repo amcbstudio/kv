@@ -266,6 +266,9 @@ kv_parse_opts() {
 		case "$1" in
 			--mode)
 				shift || kv_die "kv: --mode requires an argument" 2
+				if [ $# -lt 1 ]; then
+					kv_die "kv: --mode requires an argument" 2
+				fi
 				kv_mode=$1
 				case "$kv_mode" in strict|loose) ;; *)
 					kv_die "kv: invalid --mode: $kv_mode" 2
@@ -273,6 +276,9 @@ kv_parse_opts() {
 				;;
 			--delim)
 				shift || kv_die "kv: --delim requires an argument" 2
+				if [ $# -lt 1 ]; then
+					kv_die "kv: --delim requires an argument" 2
+				fi
 				kv_delim=$1
 				case "$kv_delim" in auto|equals|colon) ;; *)
 					kv_die "kv: invalid --delim: $kv_delim" 2
@@ -289,8 +295,12 @@ kv_parse_opts() {
 		shift
 	done
 
-	kv_file=${1-}
-	shift || true
+	if [ $# -gt 0 ]; then
+		kv_file=$1
+		shift
+	else
+		kv_file=''
+	fi
 	if [ $# -gt 0 ]; then
 		kv_die "kv: unexpected arguments" 2
 	fi
